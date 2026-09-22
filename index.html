@@ -513,8 +513,21 @@ a{color: var(--brass-bright);}
   var RAW = JSON.parse(document.getElementById('app-data').textContent);
   var STATE = {
     courses: RAW.courses || [],
-    categories: RAW.categories || []
+    categories: RAW.categories || [],
+    _savedAt: RAW._savedAt || 0
   };
+  var recoveredFromBackup = false;
+  (function recoverLocalBackupIfNewer(){
+    try{
+      var raw = localStorage.getItem('corsi-backup');
+      if (!raw) return;
+      var backup = JSON.parse(raw);
+      if (backup && typeof backup._savedAt === 'number' && backup._savedAt > (STATE._savedAt || 0)){
+        STATE = backup;
+        recoveredFromBackup = true;
+      }
+    }catch(e){}
+  })();
   var filters = { search:"", category:"", status:"", sort:"cat-asc" };
   var openCats = new Set();
   var saveTimer = null;
@@ -1108,17 +1121,20 @@ a{color: var(--brass-bright);}
   }
 
   /* ---------------- Persistence (artifact capability) ---------------- */
+  var localOnlyWarned = false;
   function setSaveState(mode){
     // mode: 'saving' | 'saved' | 'error' | 'local'
-    var dot = document.createElement('span');
     var label = '';
-    var cls = 'save-dot';
-    if (mode === 'saving'){ cls += ' saving'; label = 'Salvataggio…'; }
-    else if (mode === 'saved'){ label = 'Salvato'; }
-    else if (mode === 'error'){ cls += ' err'; label = 'Salvataggio non riuscito (dati mantenuti in locale)'; }
-    else if (mode === 'local'){ label = 'Salvato solo su questo dispositivo'; }
+    if (mode === 'saving'){ label = 'Salvataggio…'; }
+    else if (mode === 'saved'){ label = 'Salvato — sincronizzato online'; }
+    else if (mode === 'error'){ label = '⚠ Salvataggio online non riuscito (copia mantenuta in questo browser)'; }
+    else if (mode === 'local'){ label = '⚠ Non sincronizzato online — modifiche salvate solo su questo browser'; }
     var footer = document.getElementById('save-indicator-footer');
     if (footer) footer.textContent = label;
+    if ((mode === 'local' || mode === 'error') && !localOnlyWarned){
+      localOnlyWarned = true;
+      showToast('Attenzione: non riesco a sincronizzare online. Le modifiche restano su questo browser e verranno recuperate automaticamente se riapri la pagina qui.', true);
+    }
   }
 
   function buildDocument(state){
@@ -1132,12 +1148,13 @@ a{color: var(--brass-bright);}
   }
 
   function persist(){
+    STATE._savedAt = Date.now();
     try{ localStorage.setItem('corsi-backup', JSON.stringify(STATE)); }catch(e){}
     clearTimeout(saveTimer);
     setSaveState('saving');
     saveTimer = setTimeout(function(){
       doPersist();
-    }, 450);
+    }, 300);
   }
 
   function doPersist(){
@@ -1151,7 +1168,11 @@ a{color: var(--brass-bright);}
       artifact.publish(html).then(function(){
         setSaveState('saved');
       }).catch(function(err){
-        if (err && err.code === 'conflict'){ return; } // view will reload
+        if (err && err.code === 'conflict'){
+          // Another save already won; this view reloads to it shortly.
+          // Our localStorage backup (newer _savedAt) will self-heal on that reload.
+          return;
+        }
         setSaveState('error');
         showToast('Impossibile salvare le modifiche online: '+(err && err.message ? err.message : 'errore sconosciuto'), true);
       });
@@ -1221,7 +1242,13 @@ a{color: var(--brass-bright);}
   })();
 
   render();
-  setSaveState('saved');
+  if (recoveredFromBackup){
+    setSaveState('saving');
+    showToast('Recuperate modifiche non ancora sincronizzate da questo browser — le sto risalvando online…');
+    persist();
+  } else {
+    setSaveState('saved');
+  }
 
 })();
 </script>
