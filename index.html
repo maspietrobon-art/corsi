@@ -517,16 +517,24 @@ a{color: var(--brass-bright);}
     _savedAt: RAW._savedAt || 0
   };
   var recoveredFromBackup = false;
-  (function recoverLocalBackupIfNewer(){
-    try{
-      var raw = localStorage.getItem('corsi-backup');
-      if (!raw) return;
-      var backup = JSON.parse(raw);
-      if (backup && typeof backup._savedAt === 'number' && backup._savedAt > (STATE._savedAt || 0)){
-        STATE = backup;
-        recoveredFromBackup = true;
-      }
-    }catch(e){}
+  (function recoverPendingIfNewer(){
+    function readJSON(storage, key){
+      try{
+        var raw = storage.getItem(key);
+        if (!raw) return null;
+        var obj = JSON.parse(raw);
+        return (obj && typeof obj._savedAt === 'number') ? obj : null;
+      }catch(e){ return null; }
+    }
+    var fromSession = readJSON(sessionStorage, 'corsi-pending');
+    var fromLocal = readJSON(localStorage, 'corsi-backup');
+    var best = null;
+    if (fromSession) best = fromSession;
+    if (fromLocal && (!best || fromLocal._savedAt > best._savedAt)) best = fromLocal;
+    if (best && best._savedAt > (STATE._savedAt || 0)){
+      STATE = best;
+      recoveredFromBackup = true;
+    }
   })();
   var filters = { search:"", category:"", status:"", sort:"cat-asc" };
   var openCats = new Set();
@@ -1121,19 +1129,24 @@ a{color: var(--brass-bright);}
   }
 
   /* ---------------- Persistence (artifact capability) ---------------- */
+  var PENDING_KEY = 'corsi-pending';
+  var BACKUP_KEY = 'corsi-backup';
+  var isPublishing = false;
+  var pendingAfterPublish = false;
   var localOnlyWarned = false;
-  function setSaveState(mode){
+
+  function setSaveState(mode, detail){
     // mode: 'saving' | 'saved' | 'error' | 'local'
     var label = '';
     if (mode === 'saving'){ label = 'Salvataggio…'; }
     else if (mode === 'saved'){ label = 'Salvato — sincronizzato online'; }
-    else if (mode === 'error'){ label = '⚠ Salvataggio online non riuscito (copia mantenuta in questo browser)'; }
+    else if (mode === 'error'){ label = '⚠ Salvataggio online non riuscito' + (detail ? ' (' + detail + ')' : '') + ' — copia mantenuta in questo browser'; }
     else if (mode === 'local'){ label = '⚠ Non sincronizzato online — modifiche salvate solo su questo browser'; }
     var footer = document.getElementById('save-indicator-footer');
     if (footer) footer.textContent = label;
     if ((mode === 'local' || mode === 'error') && !localOnlyWarned){
       localOnlyWarned = true;
-      showToast('Attenzione: non riesco a sincronizzare online. Le modifiche restano su questo browser e verranno recuperate automaticamente se riapri la pagina qui.', true);
+      showToast('Attenzione: non riesco a sincronizzare online' + (detail ? ' (' + detail + ')' : '') + '. Le modifiche restano su questo browser e verranno recuperate automaticamente riaprendo la pagina qui.', true);
     }
   }
 
@@ -1147,14 +1160,29 @@ a{color: var(--brass-bright);}
       '</body>\n</html>';
   }
 
-  function persist(){
+  // Stash the pending state BEFORE calling publish, per platform guidance:
+  // a successful publish reloads this view too, and the reload can happen
+  // before our own .then() callback gets to run. sessionStorage survives
+  // that reload; localStorage survives a full close/reopen of the browser.
+  function stashPending(){
     STATE._savedAt = Date.now();
-    try{ localStorage.setItem('corsi-backup', JSON.stringify(STATE)); }catch(e){}
-    clearTimeout(saveTimer);
+    var json = JSON.stringify(STATE);
+    try{ sessionStorage.setItem(PENDING_KEY, json); }catch(e){}
+    try{ localStorage.setItem(BACKUP_KEY, json); }catch(e){}
+  }
+
+  function persist(){
+    stashPending();
     setSaveState('saving');
-    saveTimer = setTimeout(function(){
-      doPersist();
-    }, 300);
+    if (isPublishing){
+      // A publish is already in flight; don't start a second, concurrent one
+      // (that path can drop this edit on a conflict). It will be picked up
+      // right after the in-flight one finishes, or on the reload it triggers.
+      pendingAfterPublish = true;
+      return;
+    }
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(doPersist, 250);
   }
 
   function doPersist(){
@@ -1162,21 +1190,29 @@ a{color: var(--brass-bright);}
       setSaveState('local');
       return;
     }
+    isPublishing = true;
     window.claude.use('artifact').then(function(artifact){
-      if (!artifact){ setSaveState('local'); return; }
+      if (!artifact){ isPublishing = false; setSaveState('local'); return; }
       var html = buildDocument(STATE);
       artifact.publish(html).then(function(){
+        try{ sessionStorage.removeItem(PENDING_KEY); }catch(e){}
+        isPublishing = false;
         setSaveState('saved');
+        if (pendingAfterPublish){ pendingAfterPublish = false; persist(); }
       }).catch(function(err){
+        isPublishing = false;
         if (err && err.code === 'conflict'){
-          // Another save already won; this view reloads to it shortly.
-          // Our localStorage backup (newer _savedAt) will self-heal on that reload.
+          // Routine: another save already won and this view reloads to it.
+          // Our sessionStorage/localStorage pending copy (newer _savedAt)
+          // is recovered and re-published automatically once that reload runs.
           return;
         }
-        setSaveState('error');
-        showToast('Impossibile salvare le modifiche online: '+(err && err.message ? err.message : 'errore sconosciuto'), true);
+        var code = err && err.code ? err.code : '?';
+        setSaveState('error', code);
+        showToast('Impossibile salvare le modifiche online ['+code+']: '+(err && err.message ? err.message : 'errore sconosciuto'), true);
+        if (pendingAfterPublish){ pendingAfterPublish = false; }
       });
-    }).catch(function(){ setSaveState('local'); });
+    }).catch(function(){ isPublishing = false; setSaveState('local'); });
   }
 
   /* ---------------- Export to Excel ---------------- */
